@@ -1,4 +1,8 @@
 module ScopedSearch
+  require 'scoped_search/query_builder/field'
+  require 'scoped_search/query_builder/leaf_node'
+  require 'scoped_search/query_builder/operator_node'
+  require 'scoped_search/query_builder/logical_operator_node'
 
   # The QueryBuilder class builds an SQL query based on aquery string that is
   # provided to the search_for named scope. It uses a SearchDefinition instance
@@ -266,314 +270,97 @@ module ScopedSearch
         ON #{connection.quote_table_name(middle_table_name)}.#{connection.quote_column_name(fk2)} = #{connection.quote_table_name(endpoint_table_name)}.#{connection.quote_column_name(pk2)} #{condition2}
       SQL
     end
+  end
 
-    # This module gets included into the Field class to add SQL generation.
-    module Field
+  # The MysqlAdapter makes sure that case sensitive comparisons are used
+  # when using the (not) equals operator, regardless of the field's
+  # collation setting.
+  class MysqlAdapter < ScopedSearch::QueryBuilder
 
-      # Return an SQL representation for this field. Also make sure that
-      # the relation which includes the search field is included in the
-      # SQL query.
-      #
-      # This function may yield an :include that should be used in the
-      # ActiveRecord::Base#find call, to make sure that the field is available
-      # for the SQL query.
-      def to_sql(operator = nil, &block) # :yields: finder_option_type, value
-        num = rand(1000000)
-        connection = klass.connection
-        if key_relation
-          yield(:joins, construct_join_sql(key_relation, num) )
-          yield(:keycondition, "#{key_klass.table_name}_#{num}.#{connection.quote_column_name(key_field.to_s)} = ?")
-          klass_table_name = relation ? "#{klass.table_name}_#{num}" : klass.table_name
-          return "#{connection.quote_table_name(klass_table_name)}.#{connection.quote_column_name(field.to_s)}"
-        elsif key_field
-          yield(:joins, construct_simple_join_sql(num))
-          yield(:keycondition, "#{key_klass.table_name}_#{num}.#{connection.quote_column_name(key_field.to_s)} = ?")
-          klass_table_name = relation ? "#{klass.table_name}_#{num}" : klass.table_name
-          return "#{connection.quote_table_name(klass_table_name)}.#{connection.quote_column_name(field.to_s)}"
-        elsif relation
-          yield(:include, relation)
-        end
-        column_name = connection.quote_table_name(klass.table_name.to_s) + "." + connection.quote_column_name(field.to_s)
-        column_name = "(#{column_name} >> #{offset*word_size} & #{2**word_size - 1})" if offset
-        column_name
-      end
-
-      # This method construct join statement for a key value table
-      # It assume the following table structure
-      #  +----------+  +---------+ +--------+
-      #  | main     |  | value   | | key    |
-      #  | main_pk  |  | main_fk | |        |
-      #  |          |  | key_fk  | | key_pk |
-      #  +----------+  +---------+ +--------+
-      # uniq name for the joins are needed in case that there is more than one condition
-      # on different keys in the same query.
-      def construct_join_sql(key_relation, num )
-        join_sql = ""
-        connection = klass.connection
-        key = key_relation.to_s.singularize.to_sym
-
-        key_table = klass.reflections[key].table_name
-        value_table = klass.table_name.to_s
-
-        value_table_fk_key, key_table_pk = reflection_keys(klass.reflections[key])
-
-        main_reflection = definition.klass.reflections[relation]
-        if main_reflection
-          main_table = definition.klass.table_name
-          main_table_pk, value_table_fk_main = reflection_keys(definition.klass.reflections[relation])
-
-          join_sql = "\n  INNER JOIN #{connection.quote_table_name(value_table)} #{value_table}_#{num} ON (#{main_table}.#{main_table_pk} = #{value_table}_#{num}.#{value_table_fk_main})"
-          value_table = " #{value_table}_#{num}"
-        end
-        join_sql += "\n INNER JOIN #{connection.quote_table_name(key_table)} #{key_table}_#{num} ON (#{key_table}_#{num}.#{key_table_pk} = #{value_table}.#{value_table_fk_key}) "
-
-        return join_sql
-      end
-
-      # This method construct join statement for a key value table
-      # It assume the following table structure
-      #  +----------+  +---------+
-      #  | main     |  | key     |
-      #  | main_pk  |  | value   |
-      #  |          |  | main_fk |
-      #  +----------+  +---------+
-      # uniq name for the joins are needed in case that there is more than one condition
-      # on different keys in the same query.
-      def construct_simple_join_sql( num )
-        connection = klass.connection
-        key_value_table = klass.table_name
-
-        main_table = definition.klass.table_name
-        main_table_pk, value_table_fk_main = reflection_keys(definition.klass.reflections[relation])
-
-        join_sql = "\n  INNER JOIN #{connection.quote_table_name(key_value_table)} #{key_value_table}_#{num} ON (#{connection.quote_table_name(main_table)}.#{connection.quote_column_name(main_table_pk)} = #{key_value_table}_#{num}.#{connection.quote_column_name(value_table_fk_main)})"
-        return join_sql
-      end
-
-      def reflection_keys(reflection)
-        pk = reflection.klass.primary_key
-        fk = reflection.options[:foreign_key]
-        # activerecord prior to 3.1 doesn't respond to foreign_key method and hold the key name in the reflection primary key
-        fk ||= reflection.respond_to?(:foreign_key) ? reflection.foreign_key : reflection.primary_key_name
-        reflection.macro == :belongs_to ? [fk, pk] : [pk, fk]
-      end
-
-      def reflection_conditions(reflection)
-        return unless reflection
-        conditions = reflection.options[:conditions]
-        conditions ||= "#{reflection.options[:source]}_type = '#{reflection.options[:source_type]}'" if reflection.options[:source] && reflection.options[:source_type]
-        conditions ||= "#{reflection.try(:foreign_type)} = '#{reflection.klass}'" if  reflection.options[:polymorphic]
-        " AND #{conditions}" if conditions
-      end
-
-      def to_ext_method_sql(key, operator, value, &block)
-        raise ScopedSearch::QueryNotSupported, "'#{definition.klass}' doesn't respond to '#{ext_method}'" unless definition.klass.respond_to?(ext_method)
-        conditions = definition.klass.send(ext_method.to_sym,key, operator, value) rescue {}
-        raise ScopedSearch::QueryNotSupported, "external method '#{ext_method}' should return hash" unless conditions.kind_of?(Hash)
-        sql = ''
-        conditions.map do |notification, content|
-          case notification
-            when :include then yield(:include, content)
-            when :joins then yield(:joins, content)
-            when :conditions then sql = content
-            when :parameter then content.map{|c| yield(:parameter, c)}
-          end
-        end
-        return sql
-      end
-    end
-
-    # This module contains modules for every AST::Node class to add SQL generation.
-    module AST
-
-      # Defines the to_sql method for AST LeadNodes
-      module LeafNode
-        def to_sql(builder, definition, &block)
-          # for boolean fields allow a short format (example: for 'enabled = true' also allow 'enabled')
-          field = definition.field_by_name(value)
-          if field && field.set? && field.complete_value.values.include?(true)
-            key = field.complete_value.map{|k,v| k if v == true}.compact.first
-            return builder.set_test(field, :eq, key, &block)
-          end
-          # Search keywords found without context, just search on all the default fields
-          fragments = definition.default_fields_for(value).map do |field|
-            builder.sql_test(field, field.default_operator, value,'', &block)
-          end
-
-          case fragments.length
-            when 0 then nil
-            when 1 then fragments.first
-            else "#{fragments.join(' OR ')}"
-          end
-        end
-      end
-
-      # Defines the to_sql method for AST operator nodes
-      module OperatorNode
-
-        # Returns an IS (NOT) NULL SQL fragment
-        def to_null_sql(builder, definition, &block)
-          field = definition.field_by_name(rhs.value)
-          raise ScopedSearch::QueryNotSupported, "Field '#{rhs.value}' not recognized for searching!" unless field
-
-          if field.key_field
-            yield(:parameter, rhs.value.to_s.sub(/^.*\./,''))
-          end
-          case operator
-            when :null    then "#{field.to_sql(builder, &block)} IS NULL"
-            when :notnull then "#{field.to_sql(builder, &block)} IS NOT NULL"
-          end
-        end
-
-        # No explicit field name given, run the operator on all default fields
-        def to_default_fields_sql(builder, definition, &block)
-          raise ScopedSearch::QueryNotSupported, "Value not a leaf node" unless rhs.kind_of?(ScopedSearch::QueryLanguage::AST::LeafNode)
-
-          # Search keywords found without context, just search on all the default fields
-          fragments = definition.default_fields_for(rhs.value, operator).map { |field|
-                          builder.sql_test(field, operator, rhs.value,'', &block) }.compact
-
-          case fragments.length
-            when 0 then nil
-            when 1 then fragments.first
-            else "#{fragments.join(' OR ')}"
-          end
-        end
-
-        # Explicit field name given, run the operator on the specified field only
-        def to_single_field_sql(builder, definition, &block)
-          raise ScopedSearch::QueryNotSupported, "Field name not a leaf node" unless lhs.kind_of?(ScopedSearch::QueryLanguage::AST::LeafNode)
-          raise ScopedSearch::QueryNotSupported, "Value not a leaf node"      unless rhs.kind_of?(ScopedSearch::QueryLanguage::AST::LeafNode)
-
-          # Search only on the given field.
-          field = definition.field_by_name(lhs.value)
-          raise ScopedSearch::QueryNotSupported, "Field '#{lhs.value}' not recognized for searching!" unless field
-          builder.sql_test(field, operator, rhs.value,lhs.value, &block)
-        end
-
-        # Convert this AST node to an SQL fragment.
-        def to_sql(builder, definition, &block)
-          if operator == :not && children.length == 1
-            builder.to_not_sql(rhs, definition, &block)
-          elsif [:null, :notnull].include?(operator)
-            to_null_sql(builder, definition, &block)
-          elsif children.length == 1
-            to_default_fields_sql(builder, definition, &block)
-          elsif children.length == 2
-            to_single_field_sql(builder, definition, &block)
-          else
-            raise ScopedSearch::QueryNotSupported, "Don't know how to handle this operator node: #{operator.inspect} with #{children.inspect}!"
-          end
-        end
-      end
-
-      # Defines the to_sql method for AST AND/OR operators
-      module LogicalOperatorNode
-        def to_sql(builder, definition, &block)
-          fragments = children.map { |c| c.to_sql(builder, definition, &block) }.map { |sql| "(#{sql})" unless sql.blank? }.compact
-          fragments.empty? ? nil : "#{fragments.join(" #{operator.to_s.upcase} ")}"
-        end
-      end
-    end
-
-    # The MysqlAdapter makes sure that case sensitive comparisons are used
-    # when using the (not) equals operator, regardless of the field's
-    # collation setting.
-    class MysqlAdapter < ScopedSearch::QueryBuilder
-
-      # Patches the default <tt>sql_operator</tt> method to add
-      # <tt>BINARY</tt> after the equals and not equals operator to force
-      # case-sensitive comparisons.
-      def sql_operator(operator, field)
-        if [:ne, :eq].include?(operator) && field.textual?
-          "#{SQL_OPERATORS[operator]} BINARY"
-        else
-          super(operator, field)
-        end
-      end
-    end
-
-    class Mysql2Adapter < ScopedSearch::QueryBuilder
-       # Patches the default <tt>sql_operator</tt> method to add
-      # <tt>BINARY</tt> after the equals and not equals operator to force
-      # case-sensitive comparisons.
-      def sql_operator(operator, field)
-        if [:ne, :eq].include?(operator) && field.textual?
-          "#{SQL_OPERATORS[operator]} BINARY"
-        else
-          super(operator, field)
-        end
-      end
-    end
-
-    # The PostgreSQLAdapter make sure that searches are case sensitive when
-    # using the like/unlike operators, by using the PostrgeSQL-specific
-    # <tt>ILIKE operator</tt> instead of <tt>LIKE</tt>.
-    class PostgreSQLAdapter < ScopedSearch::QueryBuilder
-
-      # Switches out the default query generation of the <tt>sql_test</tt>
-      # method if full text searching is enabled and a text search is being
-      # performed.
-      def sql_test(field, operator, value, lhs, &block)
-        if [:like, :unlike].include?(operator) and field.full_text_search
-          yield(:parameter, value)
-          negation = (operator == :unlike) ? "NOT " : ""
-          locale = (field.full_text_search == true) ? 'english' : field.full_text_search
-          return "#{negation}to_tsvector('#{locale}', #{field.to_sql(operator, &block)}) #{self.sql_operator(operator, field)} to_tsquery('#{locale}', ?)"
-        else
-          super
-        end
-      end
-
-      # Switches out the default LIKE operator in the default <tt>sql_operator</tt> 
-      # method for ILIKE or @@ if full text searching is enabled.
-      def sql_operator(operator, field)
-        raise ScopedSearch::QueryNotSupported, "the operator '#{operator}' is not supported for field type '#{field.type}'" if [:like, :unlike].include?(operator) and !field.textual?
-        return '@@' if [:like, :unlike].include?(operator) and field.full_text_search
-        case operator
-          when :like   then 'ILIKE'
-          when :unlike then 'NOT ILIKE'
-          else super(operator, field)
-        end
-      end
-
-      # Returns a NOT (...)  SQL fragment that negates the current AST node's children
-      def to_not_sql(rhs, definition, &block)
-        "NOT COALESCE(#{rhs.to_sql(self, definition, &block)}, false)"
-      end
-
-      def order_by(order, &block)
-        sql = super(order, &block)
-        sql += sql.include?('DESC') ? ' NULLS LAST ' : ' NULLS FIRST ' if sql
-        sql
-      end
-    end
-
-    # The Oracle adapter also requires some tweaks to make the case insensitive LIKE work.
-    class OracleEnhancedAdapter < ScopedSearch::QueryBuilder
-
-      def sql_test(field, operator, value, lhs, &block) # :yields: finder_option_type, value
-        if field.key_field
-          yield(:parameter, lhs.sub(/^.*\./,''))
-        end
-        if field.textual? && [:like, :unlike].include?(operator)
-          yield(:parameter, (value !~ /^\%|\*/ && value !~ /\%|\*$/) ? "%#{value}%" : value.to_s.tr_s('%*', '%'))
-          return "LOWER(#{field.to_sql(operator, &block)}) #{self.sql_operator(operator, field)} LOWER(?)"
-        elsif field.temporal?
-          return datetime_test(field, operator, value, &block)
-        else
-          yield(:parameter, value)
-          return "#{field.to_sql(operator, &block)} #{self.sql_operator(operator, field)} ?"
-        end
+    # Patches the default <tt>sql_operator</tt> method to add
+    # <tt>BINARY</tt> after the equals and not equals operator to force
+    # case-sensitive comparisons.
+    def sql_operator(operator, field)
+      if [:ne, :eq].include?(operator) && field.textual?
+        "#{SQL_OPERATORS[operator]} BINARY"
+      else
+        super(operator, field)
       end
     end
   end
 
-  # Include the modules into the corresponding classes
-  # to add SQL generation capabilities to them.
+  class Mysql2Adapter < ScopedSearch::QueryBuilder
+     # Patches the default <tt>sql_operator</tt> method to add
+    # <tt>BINARY</tt> after the equals and not equals operator to force
+    # case-sensitive comparisons.
+    def sql_operator(operator, field)
+      if [:ne, :eq].include?(operator) && field.textual?
+        "#{SQL_OPERATORS[operator]} BINARY"
+      else
+        super(operator, field)
+      end
+    end
+  end
 
-  Definition::Field.send(:include, QueryBuilder::Field)
-  QueryLanguage::AST::LeafNode.send(:include, QueryBuilder::AST::LeafNode)
-  QueryLanguage::AST::OperatorNode.send(:include, QueryBuilder::AST::OperatorNode)
-  QueryLanguage::AST::LogicalOperatorNode.send(:include, QueryBuilder::AST::LogicalOperatorNode)
+  # The PostgreSQLAdapter make sure that searches are case sensitive when
+  # using the like/unlike operators, by using the PostrgeSQL-specific
+  # <tt>ILIKE operator</tt> instead of <tt>LIKE</tt>.
+  class PostgreSQLAdapter < ScopedSearch::QueryBuilder
+
+    # Switches out the default query generation of the <tt>sql_test</tt>
+    # method if full text searching is enabled and a text search is being
+    # performed.
+    def sql_test(field, operator, value, lhs, &block)
+      if [:like, :unlike].include?(operator) and field.full_text_search
+        yield(:parameter, value)
+        negation = (operator == :unlike) ? "NOT " : ""
+        locale = (field.full_text_search == true) ? 'english' : field.full_text_search
+        return "#{negation}to_tsvector('#{locale}', #{field.to_sql(operator, &block)}) #{self.sql_operator(operator, field)} to_tsquery('#{locale}', ?)"
+      else
+        super
+      end
+    end
+
+    # Switches out the default LIKE operator in the default <tt>sql_operator</tt> 
+    # method for ILIKE or @@ if full text searching is enabled.
+    def sql_operator(operator, field)
+      raise ScopedSearch::QueryNotSupported, "the operator '#{operator}' is not supported for field type '#{field.type}'" if [:like, :unlike].include?(operator) and !field.textual?
+      return '@@' if [:like, :unlike].include?(operator) and field.full_text_search
+      case operator
+        when :like   then 'ILIKE'
+        when :unlike then 'NOT ILIKE'
+        else super(operator, field)
+      end
+    end
+
+    # Returns a NOT (...)  SQL fragment that negates the current AST node's children
+    def to_not_sql(rhs, definition, &block)
+      "NOT COALESCE(#{rhs.to_sql(self, definition, &block)}, false)"
+    end
+
+    def order_by(order, &block)
+      sql = super(order, &block)
+      sql += sql.include?('DESC') ? ' NULLS LAST ' : ' NULLS FIRST ' if sql
+      sql
+    end
+  end
+
+  # The Oracle adapter also requires some tweaks to make the case insensitive LIKE work.
+  class OracleEnhancedAdapter < ScopedSearch::QueryBuilder
+
+    def sql_test(field, operator, value, lhs, &block) # :yields: finder_option_type, value
+      if field.key_field
+        yield(:parameter, lhs.sub(/^.*\./,''))
+      end
+      if field.textual? && [:like, :unlike].include?(operator)
+        yield(:parameter, (value !~ /^\%|\*/ && value !~ /\%|\*$/) ? "%#{value}%" : value.to_s.tr_s('%*', '%'))
+        return "LOWER(#{field.to_sql(operator, &block)}) #{self.sql_operator(operator, field)} LOWER(?)"
+      elsif field.temporal?
+        return datetime_test(field, operator, value, &block)
+      else
+        yield(:parameter, value)
+        return "#{field.to_sql(operator, &block)} #{self.sql_operator(operator, field)} ?"
+      end
+    end
+  end
 end

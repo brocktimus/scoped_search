@@ -1,5 +1,4 @@
 module ScopedSearch::QueryLanguage
-
   require 'scoped_search/query_language/ast'
   require 'scoped_search/query_language/tokenizer'
   require 'scoped_search/query_language/parser'
@@ -34,5 +33,3 @@ module ScopedSearch::QueryLanguage
 
   end
 end
-
-
